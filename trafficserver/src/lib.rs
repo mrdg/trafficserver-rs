@@ -262,13 +262,17 @@ fn init_headers(txn: TSHttpTxn, init: HeaderInitFn) -> Option<Headers> {
     Some(Headers::new(buf, loc))
 }
 
+pub enum Action {
+    Resume,
+}
+
 pub trait Plugin {
-    fn handle_read_request_headers(&mut self, transaction: &mut Transaction) {
-        transaction.resume();
+    fn handle_read_request_headers(&mut self, _transaction: &mut Transaction) -> Action {
+        Action::Resume
     }
 
-    fn handle_send_response_headers(&mut self, transaction: &mut Transaction) {
-        transaction.resume();
+    fn handle_send_response_headers(&mut self, _transaction: &mut Transaction) -> Action {
+        Action::Resume
     }
 }
 
@@ -350,14 +354,17 @@ impl PluginState {
     }
 
     fn invoke_plugin(&mut self, event: TSEvent, transaction: &mut Transaction) {
-        match event as u32 {
+        let action = match event as u32 {
             TSEvent_TS_EVENT_HTTP_READ_REQUEST_HDR => {
                 self.plugin.handle_read_request_headers(transaction)
             }
             TSEvent_TS_EVENT_HTTP_SEND_RESPONSE_HDR => {
                 self.plugin.handle_send_response_headers(transaction)
             }
-            _ => transaction.resume(),
+            _ => unreachable!(),
+        };
+        match action {
+            Action::Resume => transaction.resume(),
         }
     }
 }

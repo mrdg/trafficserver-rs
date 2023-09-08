@@ -1,31 +1,31 @@
-use trafficserver::{log_debug, Action, Hook, Plugin, Transaction};
+use trafficserver::{log_debug, Action, GlobalPlugin, Hook, Plugin, Transaction};
 
 const PLUGIN: &str = "plugin";
 
 fn init(_args: Vec<String>) {
     trafficserver::register_plugin("ExamplePlugin", "example", "mail@example.com");
 
-    let plugin = Box::new(ExamplePlugin {});
-    trafficserver::register_global_hooks(vec![Hook::HttpReadRequestHeaders], plugin);
+    let handler = Box::new(GlobalHandler {});
+    trafficserver::register_global_hooks(vec![Hook::HttpReadRequestHeaders], handler);
 }
 
 trafficserver::plugin_init!(init);
 
-struct ExamplePlugin {}
+struct GlobalHandler {}
 
-impl Plugin for ExamplePlugin {
-    fn handle_read_request_headers(&mut self, transaction: &mut Transaction) -> Action {
+impl GlobalPlugin for GlobalHandler {
+    fn handle_read_request_headers(&self, transaction: &mut Transaction) -> Action {
         log_debug!(PLUGIN, "global plugin: read request headers");
 
-        let plugin = Box::new(TransactionPlugin {});
+        let plugin = Box::new(TransactionHandler {});
         transaction.add_plugin(vec![Hook::HttpSendResponseHeaders], plugin);
         Action::Resume
     }
 }
 
-struct TransactionPlugin {}
+struct TransactionHandler {}
 
-impl Plugin for TransactionPlugin {
+impl Plugin for TransactionHandler {
     fn handle_send_response_headers(&mut self, transaction: &mut Transaction) -> Action {
         log_debug!(PLUGIN, "transaction plugin: send response headers");
 

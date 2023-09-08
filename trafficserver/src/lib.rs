@@ -276,6 +276,26 @@ pub trait Plugin {
     }
 }
 
+pub trait GlobalPlugin {
+    fn handle_read_request_headers(&self, _transaction: &mut Transaction) -> Action {
+        Action::Resume
+    }
+
+    fn handle_send_response_headers(&self, _transaction: &mut Transaction) -> Action {
+        Action::Resume
+    }
+}
+
+impl<T: GlobalPlugin> Plugin for T {
+    fn handle_read_request_headers(&mut self, transaction: &mut Transaction) -> Action {
+        T::handle_read_request_headers(self, transaction)
+    }
+
+    fn handle_send_response_headers(&mut self, transaction: &mut Transaction) -> Action {
+        T::handle_send_response_headers(self, transaction)
+    }
+}
+
 #[macro_export]
 macro_rules! plugin_init {
     ($init: ident) => {

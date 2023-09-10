@@ -25,6 +25,11 @@ fn main() {
     let header_path: PathBuf = [header_dir, "ts", "ts.h"].iter().collect();
     let bindings = Builder::default()
         .header(header_path.to_string_lossy())
+        .newtype_enum("TSReturnCode")
+        .newtype_enum("TSEvent")
+        .newtype_enum("TSCacheLookupResult")
+        .newtype_enum("TSHttpHookID")
+        .newtype_enum("TSHttpStatus")
         .generate()
         .expect("error generating bindings");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());

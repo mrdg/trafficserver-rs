@@ -1,31 +1,47 @@
 use std::{
-    ffi::{self, CStr, CString},
+    ffi::{self, CString},
     ptr,
     rc::Rc,
+    slice, str,
 };
 
 pub use trafficserver_sys::TSDebug;
+pub use trafficserver_sys::TSHttpStatus as HttpStatus;
 
 use trafficserver_sys::{
-    TSCont, TSContCreate, TSContDataGet, TSContDataSet, TSContDestroy, TSEvent,
-    TSEvent_TS_EVENT_HTTP_CONTINUE, TSEvent_TS_EVENT_HTTP_READ_REQUEST_HDR,
-    TSEvent_TS_EVENT_HTTP_SEND_RESPONSE_HDR, TSEvent_TS_EVENT_HTTP_TXN_CLOSE, TSHandleMLocRelease,
-    TSHttpHookAdd, TSHttpHookID_TS_HTTP_READ_REQUEST_HDR_HOOK,
-    TSHttpHookID_TS_HTTP_SEND_RESPONSE_HDR_HOOK, TSHttpHookID_TS_HTTP_TXN_CLOSE_HOOK, TSHttpTxn,
-    TSHttpTxnClientReqGet, TSHttpTxnClientRespGet, TSHttpTxnHookAdd, TSHttpTxnReenable, TSMBuffer,
-    TSMLoc, TSMimeHdrFieldAppend, TSMimeHdrFieldCreate, TSMimeHdrFieldDestroy, TSMimeHdrFieldFind,
-    TSMimeHdrFieldGet, TSMimeHdrFieldNameGet, TSMimeHdrFieldNameSet, TSMimeHdrFieldNext,
-    TSMimeHdrFieldNextDup, TSMimeHdrFieldValueStringGet, TSMimeHdrFieldValueStringInsert,
-    TSMimeHdrFieldsCount, TSPluginRegister, TSPluginRegistrationInfo, TSReturnCode,
-    TSReturnCode_TS_ERROR, TSReturnCode_TS_SUCCESS,
+    TSCacheLookupResult, TSCont, TSContCreate, TSContDataGet, TSContDataSet, TSContDestroy,
+    TSEvent, TSHandleMLocRelease, TSHttpHdrStatusGet, TSHttpHookAdd, TSHttpHookID, TSHttpTxn,
+    TSHttpTxnCacheLookupStatusGet, TSHttpTxnCacheLookupStatusSet, TSHttpTxnCachedReqGet,
+    TSHttpTxnCachedRespGet, TSHttpTxnClientReqGet, TSHttpTxnClientRespGet, TSHttpTxnHookAdd,
+    TSHttpTxnReenable, TSMBuffer, TSMLoc, TSMimeHdrFieldAppend, TSMimeHdrFieldCreate,
+    TSMimeHdrFieldDestroy, TSMimeHdrFieldFind, TSMimeHdrFieldGet, TSMimeHdrFieldNameGet,
+    TSMimeHdrFieldNameSet, TSMimeHdrFieldNext, TSMimeHdrFieldNextDup, TSMimeHdrFieldValueStringGet,
+    TSMimeHdrFieldValueStringInsert, TSMimeHdrFieldsCount, TSPluginRegister,
+    TSPluginRegistrationInfo, TSReturnCode,
 };
 
 pub struct Response {
+    pub status: HttpStatus,
     pub headers: Headers,
+}
+
+impl Response {
+    fn new(txn: TSHttpTxn, header_init: HeaderInitFn) -> Self {
+        let headers = init_headers(txn, header_init).unwrap();
+        let status = unsafe { TSHttpHdrStatusGet(headers.buf, headers.loc) };
+        Self { status, headers }
+    }
 }
 
 pub struct Request {
     pub headers: Headers,
+}
+
+impl Request {
+    fn new(txn: TSHttpTxn, header_init: HeaderInitFn) -> Self {
+        let headers = init_headers(txn, header_init).unwrap();
+        Self { headers }
+    }
 }
 
 pub struct Headers {
@@ -61,7 +77,7 @@ impl Headers {
     pub fn append(&mut self, key: &str, value: &str) {
         let mut field_loc: TSMLoc = ptr::null_mut();
         let res = unsafe { TSMimeHdrFieldCreate(self.buf, self.loc, &mut field_loc) };
-        if res != TSReturnCode_TS_SUCCESS {
+        if res != TSReturnCode::TS_SUCCESS {
             return;
         }
         unsafe {
@@ -115,7 +131,7 @@ pub struct HeaderField<'a> {
 impl<'a> HeaderField<'a> {
     pub fn key(&self) -> &str {
         let mut length: ffi::c_int = 0;
-        let c_str = unsafe {
+        unsafe {
             let value = TSMimeHdrFieldNameGet(
                 self.handle.headers.buf,
                 self.handle.headers.loc,
@@ -125,15 +141,14 @@ impl<'a> HeaderField<'a> {
             if value.is_null() {
                 return "";
             }
-            CStr::from_ptr(value)
-        };
-        let str = c_str.to_str().unwrap();
-        &str[0..length as usize]
+            let s = slice::from_raw_parts::<u8>(value as *const u8, length as usize);
+            str::from_utf8(s).ok().unwrap_or_default()
+        }
     }
 
     pub fn value(&self) -> &str {
         let mut length: ffi::c_int = 0;
-        let c_str = unsafe {
+        unsafe {
             let value = TSMimeHdrFieldValueStringGet(
                 self.handle.headers.buf,
                 self.handle.headers.loc,
@@ -144,10 +159,9 @@ impl<'a> HeaderField<'a> {
             if value.is_null() {
                 return "";
             }
-            CStr::from_ptr(value)
-        };
-        let str = c_str.to_str().unwrap();
-        &str[0..length as usize]
+            let s = slice::from_raw_parts::<u8>(value as *const u8, length as usize);
+            str::from_utf8(s).ok().unwrap_or_default()
+        }
     }
 }
 
@@ -210,27 +224,63 @@ impl<'a> Iterator for HeaderIter<'a> {
     }
 }
 
-pub struct Transaction {
-    txn: TSHttpTxn,
+// TODO: use sealed traits
+pub trait State {}
+impl State for ReadRequestState {}
+impl State for CacheLookupState {}
+impl State for SendResponseState {}
+
+pub trait PreCacheState {}
+impl PreCacheState for ReadRequestState {}
+
+pub struct ReadRequestState {
     pub client_request: Request,
-    pub client_response: Option<Response>,
 }
 
-impl Transaction {
+impl ReadRequestState {
     fn new(txn: TSHttpTxn) -> Self {
         Self {
-            // I think this needs to be initialized lazily, like the C++ plugin does it.
-            client_request: Request {
-                headers: init_headers(txn, TSHttpTxnClientReqGet).unwrap(),
-            },
-            client_response: init_headers(txn, TSHttpTxnClientRespGet)
-                .map(|headers| Response { headers }),
-            txn,
+            client_request: Request::new(txn, TSHttpTxnClientReqGet),
         }
     }
+}
 
-    pub fn resume(&self) {
-        unsafe { TSHttpTxnReenable(self.txn, TSEvent_TS_EVENT_HTTP_CONTINUE) }
+pub struct CacheLookupState {
+    pub client_request: Request,
+    pub cache_status: CacheStatus,
+}
+
+impl CacheLookupState {
+    fn new(txn: TSHttpTxn) -> Self {
+        Self {
+            client_request: Request::new(txn, TSHttpTxnClientReqGet),
+            cache_status: cache_lookup_status(txn),
+        }
+    }
+}
+
+pub struct SendResponseState {
+    pub client_request: Request,
+    pub client_response: Response,
+}
+
+impl SendResponseState {
+    fn new(txn: TSHttpTxn) -> Self {
+        Self {
+            client_request: Request::new(txn, TSHttpTxnClientReqGet),
+            client_response: Response::new(txn, TSHttpTxnClientRespGet),
+        }
+    }
+}
+
+pub struct Transaction<S: State> {
+    txn: TSHttpTxn,
+    pub state: S,
+}
+
+impl<S: State> Transaction<S> {
+    fn new(txn: TSHttpTxn, state: S) -> Transaction<S> {
+        Self { txn, state }
     }
 
     pub fn add_plugin(&self, hooks: Vec<Hook>, plugin: Box<dyn Plugin>) {
@@ -240,10 +290,93 @@ impl Transaction {
         let cont_data = Box::into_raw(state) as *mut ffi::c_void;
         unsafe { TSContDataSet(cont, cont_data) }
         for hook in hooks {
-            unsafe { TSHttpTxnHookAdd(self.txn, hook as u32, cont) };
+            unsafe { TSHttpTxnHookAdd(self.txn, hook.into(), cont) };
         }
-        // TODO: make sure we don't register this twice
-        unsafe { TSHttpTxnHookAdd(self.txn, TSHttpHookID_TS_HTTP_TXN_CLOSE_HOOK, cont) };
+        unsafe { TSHttpTxnHookAdd(self.txn, TSHttpHookID::TS_HTTP_TXN_CLOSE_HOOK, cont) };
+    }
+}
+
+impl<S: State + PreCacheState> Transaction<S> {
+    pub fn set_cache_url(&mut self) {
+        todo!()
+    }
+}
+
+impl Transaction<CacheLookupState> {
+    pub fn set_cache_status(&mut self, status: CacheStatusOverride) -> ReturnCode {
+        set_cache_status(self.txn, &self.state.cache_status, status)
+    }
+}
+
+pub struct CacheEntry {
+    pub request: Request,
+    pub response: Response,
+}
+
+impl CacheEntry {
+    fn new(txn: TSHttpTxn) -> Self {
+        Self {
+            request: Request::new(txn, TSHttpTxnCachedReqGet),
+            response: Response::new(txn, TSHttpTxnCachedRespGet),
+        }
+    }
+}
+
+pub enum CacheStatus {
+    HitFresh(CacheEntry),
+    HitStale(CacheEntry),
+    Miss,
+    Skipped,
+    None,
+}
+
+impl CacheStatus {
+    fn has_cache_entry(&self) -> bool {
+        matches!(self, Self::HitFresh(_) | Self::HitStale(_))
+    }
+}
+
+pub enum CacheStatusOverride {
+    HitFresh,
+    HitStale,
+    Miss,
+}
+
+fn set_cache_status(txn: TSHttpTxn, current: &CacheStatus, new: CacheStatusOverride) -> ReturnCode {
+    use CacheStatusOverride::*;
+    let status = match new {
+        HitFresh | HitStale if !current.has_cache_entry() => {
+            return ReturnCode::Error;
+        }
+        HitStale => TSCacheLookupResult::TS_CACHE_LOOKUP_HIT_STALE,
+        HitFresh => TSCacheLookupResult::TS_CACHE_LOOKUP_HIT_FRESH,
+        Miss => TSCacheLookupResult::TS_CACHE_LOOKUP_MISS,
+    };
+    let res = unsafe { TSHttpTxnCacheLookupStatusSet(txn, status.0 as i32) };
+    if res == TSReturnCode::TS_ERROR {
+        return ReturnCode::Error;
+    }
+
+    ReturnCode::Success
+}
+
+fn cache_lookup_status(txn: TSHttpTxn) -> CacheStatus {
+    let mut cache_status: ffi::c_int = 0;
+    let res = unsafe { TSHttpTxnCacheLookupStatusGet(txn, &mut cache_status) };
+    if res == TSReturnCode::TS_ERROR {
+        return CacheStatus::None;
+    }
+
+    match TSCacheLookupResult(cache_status as u32) {
+        TSCacheLookupResult::TS_CACHE_LOOKUP_HIT_FRESH => {
+            CacheStatus::HitFresh(CacheEntry::new(txn))
+        }
+        TSCacheLookupResult::TS_CACHE_LOOKUP_HIT_STALE => {
+            CacheStatus::HitStale(CacheEntry::new(txn))
+        }
+        TSCacheLookupResult::TS_CACHE_LOOKUP_MISS => CacheStatus::Miss,
+        TSCacheLookupResult::TS_CACHE_LOOKUP_SKIPPED => CacheStatus::Skipped,
+        _ => CacheStatus::None,
     }
 }
 
@@ -256,7 +389,7 @@ type HeaderInitFn = unsafe extern "C" fn(
 fn init_headers(txn: TSHttpTxn, init: HeaderInitFn) -> Option<Headers> {
     let mut buf: TSMBuffer = ptr::null_mut();
     let mut loc: TSMLoc = ptr::null_mut();
-    if unsafe { init(txn, &mut buf, &mut loc) } != TSReturnCode_TS_SUCCESS {
+    if unsafe { init(txn, &mut buf, &mut loc) } != TSReturnCode::TS_SUCCESS {
         return None;
     }
     Some(Headers::new(buf, loc))
@@ -267,32 +400,50 @@ pub enum Action {
 }
 
 pub trait Plugin {
-    fn handle_read_request_headers(&mut self, _transaction: &mut Transaction) -> Action {
+    fn read_request_headers(&mut self, _transaction: &mut Transaction<ReadRequestState>) -> Action {
         Action::Resume
     }
 
-    fn handle_send_response_headers(&mut self, _transaction: &mut Transaction) -> Action {
+    fn cache_lookup(&mut self, _transaction: &mut Transaction<CacheLookupState>) -> Action {
+        Action::Resume
+    }
+
+    fn send_response_headers(
+        &mut self,
+        _transaction: &mut Transaction<SendResponseState>,
+    ) -> Action {
         Action::Resume
     }
 }
 
 pub trait GlobalPlugin {
-    fn handle_read_request_headers(&self, _transaction: &mut Transaction) -> Action {
+    fn read_request_headers(&self, _transaction: &mut Transaction<ReadRequestState>) -> Action {
         Action::Resume
     }
 
-    fn handle_send_response_headers(&self, _transaction: &mut Transaction) -> Action {
+    fn cache_lookup(&self, _transaction: &mut Transaction<CacheLookupState>) -> Action {
+        Action::Resume
+    }
+
+    fn send_response_headers(&self, _transaction: &mut Transaction<SendResponseState>) -> Action {
         Action::Resume
     }
 }
 
 impl<T: GlobalPlugin> Plugin for T {
-    fn handle_read_request_headers(&mut self, transaction: &mut Transaction) -> Action {
-        T::handle_read_request_headers(self, transaction)
+    fn read_request_headers(&mut self, transaction: &mut Transaction<ReadRequestState>) -> Action {
+        T::read_request_headers(self, transaction)
     }
 
-    fn handle_send_response_headers(&mut self, transaction: &mut Transaction) -> Action {
-        T::handle_send_response_headers(self, transaction)
+    fn cache_lookup(&mut self, transaction: &mut Transaction<CacheLookupState>) -> Action {
+        T::cache_lookup(self, transaction)
+    }
+
+    fn send_response_headers(
+        &mut self,
+        transaction: &mut Transaction<SendResponseState>,
+    ) -> Action {
+        T::send_response_headers(self, transaction)
     }
 }
 
@@ -325,13 +476,12 @@ macro_rules! log_debug {
     }
 }
 
-#[repr(i32)]
-pub enum TsReturnCode {
-    Success = TSReturnCode_TS_SUCCESS,
-    Error = TSReturnCode_TS_ERROR,
+pub enum ReturnCode {
+    Success,
+    Error,
 }
 
-pub fn register_plugin(name: &str, vendor: &str, email: &str) -> TsReturnCode {
+pub fn register_plugin(name: &str, vendor: &str, email: &str) -> ReturnCode {
     let name = CString::new(name.to_string()).unwrap();
     let vendor = CString::new(vendor.to_string()).unwrap();
     let email = CString::new(email.to_string()).unwrap();
@@ -340,10 +490,10 @@ pub fn register_plugin(name: &str, vendor: &str, email: &str) -> TsReturnCode {
         vendor_name: vendor.as_ptr(),
         support_email: email.as_ptr(),
     };
-    if unsafe { TSPluginRegister(&info) } == TSReturnCode_TS_ERROR {
-        return TsReturnCode::Error;
+    if unsafe { TSPluginRegister(&info) } == TSReturnCode::TS_ERROR {
+        return ReturnCode::Error;
     }
-    TsReturnCode::Success
+    ReturnCode::Success
 }
 
 pub fn register_global_hooks(hooks: Vec<Hook>, plugin: Box<dyn Plugin>) {
@@ -354,14 +504,24 @@ pub fn register_global_hooks(hooks: Vec<Hook>, plugin: Box<dyn Plugin>) {
     let cont_data = Box::into_raw(state) as *mut ffi::c_void;
     unsafe { TSContDataSet(cont, cont_data) }
     for hook in hooks {
-        unsafe { TSHttpHookAdd(hook as u32, cont) };
+        unsafe { TSHttpHookAdd(hook.into(), cont) };
     }
 }
 
-#[repr(u32)]
 pub enum Hook {
-    HttpReadRequestHeaders = TSHttpHookID_TS_HTTP_READ_REQUEST_HDR_HOOK,
-    HttpSendResponseHeaders = TSHttpHookID_TS_HTTP_SEND_RESPONSE_HDR_HOOK,
+    HttpReadRequestHeaders,
+    HttpCacheLookup,
+    HttpSendResponseHeaders,
+}
+
+impl Into<TSHttpHookID> for Hook {
+    fn into(self) -> TSHttpHookID {
+        match self {
+            Hook::HttpReadRequestHeaders => TSHttpHookID::TS_HTTP_READ_REQUEST_HDR_HOOK,
+            Hook::HttpCacheLookup => TSHttpHookID::TS_HTTP_CACHE_LOOKUP_COMPLETE_HOOK,
+            Hook::HttpSendResponseHeaders => TSHttpHookID::TS_HTTP_SEND_RESPONSE_HDR_HOOK,
+        }
+    }
 }
 
 struct PluginState {
@@ -373,34 +533,39 @@ impl PluginState {
         Self { plugin }
     }
 
-    fn invoke_plugin(&mut self, event: TSEvent, transaction: &mut Transaction) {
-        let action = match event as u32 {
-            TSEvent_TS_EVENT_HTTP_READ_REQUEST_HDR => {
-                self.plugin.handle_read_request_headers(transaction)
+    fn invoke_plugin(&mut self, event: TSEvent, txn: TSHttpTxn) {
+        let action = match event {
+            TSEvent::TS_EVENT_HTTP_READ_REQUEST_HDR => {
+                let mut transaction = Transaction::new(txn, ReadRequestState::new(txn));
+                self.plugin.read_request_headers(&mut transaction)
             }
-            TSEvent_TS_EVENT_HTTP_SEND_RESPONSE_HDR => {
-                self.plugin.handle_send_response_headers(transaction)
+            TSEvent::TS_EVENT_HTTP_CACHE_LOOKUP_COMPLETE => {
+                let mut transaction = Transaction::new(txn, CacheLookupState::new(txn));
+                self.plugin.cache_lookup(&mut transaction)
             }
-            _ => unreachable!(),
+            TSEvent::TS_EVENT_HTTP_SEND_RESPONSE_HDR => {
+                let mut transaction = Transaction::new(txn, SendResponseState::new(txn));
+                self.plugin.send_response_headers(&mut transaction)
+            }
+            _ => panic!("unknown event type: {:?}", event),
         };
         match action {
-            Action::Resume => transaction.resume(),
+            Action::Resume => unsafe { TSHttpTxnReenable(txn, TSEvent::TS_EVENT_HTTP_CONTINUE) },
         }
     }
 }
 
 unsafe extern "C" fn handle_event(contp: TSCont, event: TSEvent, edata: *mut ffi::c_void) -> i32 {
     let cont_data = TSContDataGet(contp);
-    if event == TSEvent_TS_EVENT_HTTP_TXN_CLOSE {
+    if event == TSEvent::TS_EVENT_HTTP_TXN_CLOSE {
         TSContDestroy(contp);
         let _ = Box::from_raw(cont_data); // drop the plugin
-        unsafe { TSHttpTxnReenable(edata as TSHttpTxn, TSEvent_TS_EVENT_HTTP_CONTINUE) }
+        unsafe { TSHttpTxnReenable(edata as TSHttpTxn, TSEvent::TS_EVENT_HTTP_CONTINUE) }
         return 0;
     }
 
     let state: &mut PluginState = &mut *(cont_data as *mut PluginState);
-    let mut transaction = Transaction::new(edata as TSHttpTxn);
-    state.invoke_plugin(event, &mut transaction);
+    state.invoke_plugin(event, edata as TSHttpTxn);
 
     return 0;
 }

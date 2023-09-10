@@ -1,4 +1,7 @@
-use trafficserver::{log_debug, Action, GlobalPlugin, Hook, Plugin, Transaction};
+use trafficserver::{
+    log_debug, Action, CacheEntry, CacheLookupState, CacheStatus, GlobalPlugin, Hook, Plugin,
+    ReadRequestState, SendResponseState, Transaction,
+};
 
 const PLUGIN: &str = "plugin";
 
@@ -14,11 +17,14 @@ trafficserver::plugin_init!(init);
 struct GlobalHandler {}
 
 impl GlobalPlugin for GlobalHandler {
-    fn handle_read_request_headers(&self, transaction: &mut Transaction) -> Action {
+    fn read_request_headers(&self, transaction: &mut Transaction<ReadRequestState>) -> Action {
         log_debug!(PLUGIN, "global plugin: read request headers");
 
         let plugin = Box::new(TransactionHandler {});
-        transaction.add_plugin(vec![Hook::HttpSendResponseHeaders], plugin);
+        transaction.add_plugin(
+            vec![Hook::HttpSendResponseHeaders, Hook::HttpCacheLookup],
+            plugin,
+        );
         Action::Resume
     }
 }
@@ -26,10 +32,30 @@ impl GlobalPlugin for GlobalHandler {
 struct TransactionHandler {}
 
 impl Plugin for TransactionHandler {
-    fn handle_send_response_headers(&mut self, transaction: &mut Transaction) -> Action {
+    fn cache_lookup(&mut self, transaction: &mut Transaction<CacheLookupState>) -> Action {
+        match &mut transaction.state.cache_status {
+            CacheStatus::HitFresh(cached) => log_cache_hit(cached),
+            CacheStatus::HitStale(cached) => log_cache_hit(cached),
+            CacheStatus::Miss => {
+                log_debug!(PLUGIN, "cache miss");
+            }
+            CacheStatus::Skipped => {
+                log_debug!(PLUGIN, "cache lookup skipped");
+            }
+            CacheStatus::None => {
+                log_debug!(PLUGIN, "no cache lookup status");
+            }
+        };
+        Action::Resume
+    }
+
+    fn send_response_headers(
+        &mut self,
+        transaction: &mut Transaction<SendResponseState>,
+    ) -> Action {
         log_debug!(PLUGIN, "transaction plugin: send response headers");
 
-        let headers = &mut transaction.client_request.headers;
+        let headers = &mut transaction.state.client_request.headers;
 
         log_debug!(PLUGIN, "-- received {} headers", headers.len());
 
@@ -51,17 +77,33 @@ impl Plugin for TransactionHandler {
             log_debug!(PLUGIN, "  -- {}: {}", field.key(), field.value());
         }
 
-        let req = &mut transaction.client_request;
+        let req = &mut transaction.state.client_request;
 
         log_debug!(PLUGIN, "-- printing response headers");
-        if let Some(resp) = transaction.client_response.as_mut() {
-            for field in resp.headers.iter() {
-                log_debug!(PLUGIN, "  -- {}: {}", field.key(), field.value());
-            }
+        let resp = &transaction.state.client_response;
+        for field in resp.headers.iter() {
+            log_debug!(PLUGIN, "  -- {}: {}", field.key(), field.value());
         }
 
         for _field in req.headers.iter() {}
 
         Action::Resume
     }
+}
+
+fn log_cache_hit(cached: &mut CacheEntry) {
+    let status = cached.response.status;
+    let cache_control = cached
+        .response
+        .headers
+        .find("cache-control")
+        .next()
+        .map(|h| h.value().to_string());
+
+    log_debug!(
+        PLUGIN,
+        "found a cached {:?} response with cache control '{}'",
+        status,
+        cache_control.unwrap_or("".into())
+    );
 }

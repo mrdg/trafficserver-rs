@@ -21,7 +21,7 @@ use trafficserver_sys::{
 };
 
 pub struct Response {
-    pub status: HttpStatus,
+    status: HttpStatus,
     pub headers: Headers,
 }
 
@@ -30,6 +30,10 @@ impl Response {
         let headers = init_headers(txn, header_init).unwrap();
         let status = unsafe { TSHttpHdrStatusGet(headers.buf, headers.loc) };
         Self { status, headers }
+    }
+
+    pub fn status(&self) -> HttpStatus {
+        self.status
     }
 }
 
@@ -230,57 +234,33 @@ impl State for ReadRequestState {}
 impl State for CacheLookupState {}
 impl State for SendResponseState {}
 
-pub trait PreCacheState {}
-impl PreCacheState for ReadRequestState {}
+pub trait PreCache {}
+impl PreCache for ReadRequestState {}
 
-pub struct ReadRequestState {
-    pub client_request: Request,
-}
+pub trait PostCache {}
+impl PostCache for CacheLookupState {}
+impl PostCache for SendResponseState {}
 
-impl ReadRequestState {
-    fn new(txn: TSHttpTxn) -> Self {
-        Self {
-            client_request: Request::new(txn, TSHttpTxnClientReqGet),
-        }
-    }
-}
+pub struct ReadRequestState;
+pub struct CacheLookupState;
+pub struct SendResponseState;
 
-pub struct CacheLookupState {
-    pub client_request: Request,
-    pub cache_status: CacheStatus,
-}
+pub trait SendResponse {}
+impl SendResponse for SendResponseState {}
 
-impl CacheLookupState {
-    fn new(txn: TSHttpTxn) -> Self {
-        Self {
-            client_request: Request::new(txn, TSHttpTxnClientReqGet),
-            cache_status: cache_lookup_status(txn),
-        }
-    }
-}
-
-pub struct SendResponseState {
-    pub client_request: Request,
-    pub client_response: Response,
-}
-
-impl SendResponseState {
-    fn new(txn: TSHttpTxn) -> Self {
-        Self {
-            client_request: Request::new(txn, TSHttpTxnClientReqGet),
-            client_response: Response::new(txn, TSHttpTxnClientRespGet),
-        }
-    }
-}
-
-pub struct Transaction<S: State> {
+pub struct Transaction<'a, S: State> {
     txn: TSHttpTxn,
-    pub state: S,
+    inner: &'a mut TransactionInner,
+    marker: std::marker::PhantomData<S>,
 }
 
-impl<S: State> Transaction<S> {
-    fn new(txn: TSHttpTxn, state: S) -> Transaction<S> {
-        Self { txn, state }
+impl<'a, S: State> Transaction<'a, S> {
+    fn new(txn: TSHttpTxn, inner: &'a mut TransactionInner) -> Transaction<S> {
+        Self {
+            txn,
+            inner,
+            marker: Default::default(),
+        }
     }
 
     pub fn add_plugin(&self, hooks: Vec<Hook>, plugin: Box<dyn Plugin>) {
@@ -294,17 +274,76 @@ impl<S: State> Transaction<S> {
         }
         unsafe { TSHttpTxnHookAdd(self.txn, TSHttpHookID::TS_HTTP_TXN_CLOSE_HOOK, cont) };
     }
+
+    pub fn client_request(&self) -> &Request {
+        self.inner.client_request.as_ref().unwrap()
+    }
+
+    pub fn client_request_mut(&mut self) -> &mut Request {
+        self.inner.client_request.as_mut().unwrap()
+    }
 }
 
-impl<S: State + PreCacheState> Transaction<S> {
+impl<S: State + PreCache> Transaction<'_, S> {
     pub fn set_cache_url(&mut self) {
         todo!()
     }
 }
 
-impl Transaction<CacheLookupState> {
+impl<S: State + PostCache> Transaction<'_, S> {
+    pub fn cache_status(&mut self) -> &mut CacheStatus {
+        self.inner.cache_status.as_mut().unwrap()
+    }
+}
+
+impl Transaction<'_, CacheLookupState> {
     pub fn set_cache_status(&mut self, status: CacheStatusOverride) -> ReturnCode {
-        set_cache_status(self.txn, &self.state.cache_status, status)
+        let cache_status = self.inner.cache_status.as_mut().unwrap();
+        set_cache_status(self.txn, cache_status, status)
+    }
+}
+
+impl<S: State + SendResponse> Transaction<'_, S> {
+    pub fn client_response(&self) -> &Response {
+        self.inner.client_response.as_ref().unwrap()
+    }
+
+    pub fn client_response_mut(&mut self) -> &mut Response {
+        self.inner.client_response.as_mut().unwrap()
+    }
+}
+
+struct TransactionInner {
+    client_request: Option<Request>,
+    client_response: Option<Response>,
+    cache_status: Option<CacheStatus>,
+}
+
+impl TransactionInner {
+    fn new() -> Self {
+        TransactionInner {
+            client_request: None,
+            client_response: None,
+            cache_status: None,
+        }
+    }
+
+    fn set_client_request(&mut self, txn: TSHttpTxn) {
+        if self.client_request.is_none() {
+            self.client_request = Some(Request::new(txn, TSHttpTxnClientReqGet));
+        }
+    }
+
+    fn set_client_response(&mut self, txn: TSHttpTxn) {
+        if self.client_response.is_none() {
+            self.client_response = Some(Response::new(txn, TSHttpTxnClientRespGet));
+        }
+    }
+
+    fn set_cache_status(&mut self, txn: TSHttpTxn) {
+        if self.cache_status.is_none() {
+            self.cache_status = Some(cache_lookup_status(txn));
+        }
     }
 }
 
@@ -526,25 +565,34 @@ impl Into<TSHttpHookID> for Hook {
 
 struct PluginState {
     plugin: Box<dyn Plugin>,
+    tx_inner: TransactionInner,
 }
 
 impl PluginState {
     fn new(plugin: Box<dyn Plugin>) -> Self {
-        Self { plugin }
+        Self {
+            plugin,
+            tx_inner: TransactionInner::new(),
+        }
     }
 
     fn invoke_plugin(&mut self, event: TSEvent, txn: TSHttpTxn) {
+        self.tx_inner.set_client_request(txn);
+
         let action = match event {
             TSEvent::TS_EVENT_HTTP_READ_REQUEST_HDR => {
-                let mut transaction = Transaction::new(txn, ReadRequestState::new(txn));
+                let mut transaction = Transaction::new(txn, &mut self.tx_inner);
                 self.plugin.read_request_headers(&mut transaction)
             }
             TSEvent::TS_EVENT_HTTP_CACHE_LOOKUP_COMPLETE => {
-                let mut transaction = Transaction::new(txn, CacheLookupState::new(txn));
+                self.tx_inner.set_cache_status(txn);
+                let mut transaction = Transaction::new(txn, &mut self.tx_inner);
                 self.plugin.cache_lookup(&mut transaction)
             }
             TSEvent::TS_EVENT_HTTP_SEND_RESPONSE_HDR => {
-                let mut transaction = Transaction::new(txn, SendResponseState::new(txn));
+                self.tx_inner.set_client_response(txn);
+                self.tx_inner.set_cache_status(txn);
+                let mut transaction = Transaction::new(txn, &mut self.tx_inner);
                 self.plugin.send_response_headers(&mut transaction)
             }
             _ => panic!("unknown event type: {:?}", event),

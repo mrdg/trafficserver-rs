@@ -33,7 +33,7 @@ struct TransactionHandler {}
 
 impl Plugin for TransactionHandler {
     fn cache_lookup(&mut self, transaction: &mut Transaction<CacheLookupState>) -> Action {
-        match &mut transaction.state.cache_status {
+        match &mut transaction.cache_status() {
             CacheStatus::HitFresh(cached) => log_cache_hit(cached),
             CacheStatus::HitStale(cached) => log_cache_hit(cached),
             CacheStatus::Miss => {
@@ -55,44 +55,40 @@ impl Plugin for TransactionHandler {
     ) -> Action {
         log_debug!(PLUGIN, "transaction plugin: send response headers");
 
-        let headers = &mut transaction.state.client_request.headers;
+        let req = transaction.client_request_mut();
 
-        log_debug!(PLUGIN, "-- received {} headers", headers.len());
+        log_debug!(PLUGIN, "-- received {} headers", req.headers.len());
 
         log_debug!(PLUGIN, "-- mutating the request headers");
-        headers.remove("x-foo");
-        headers.set("x-bar", "1");
-        headers.append("x-bar", "2");
+        req.headers.remove("x-foo");
+        req.headers.set("x-bar", "1");
+        req.headers.append("x-bar", "2");
 
         log_debug!(PLUGIN, "-- iterating over all header fields");
-        for field in headers.iter() {
+        for field in req.headers.iter() {
             log_debug!(PLUGIN, "  -- {}: {}", field.key(), field.value());
         }
         log_debug!(PLUGIN, "-- check if header field is present");
-        log_debug!(PLUGIN, "  -- x-foo: {}", headers.contains_key("x-foo"));
-        log_debug!(PLUGIN, "  -- x-bar: {}", headers.contains_key("x-bar"));
+        log_debug!(PLUGIN, "  -- x-foo: {}", req.headers.contains_key("x-foo"));
+        log_debug!(PLUGIN, "  -- x-bar: {}", req.headers.contains_key("x-bar"));
 
         log_debug!(PLUGIN, "-- iterating over header fields with name");
-        for field in headers.find("x-bar") {
+        for field in req.headers.find("x-bar") {
             log_debug!(PLUGIN, "  -- {}: {}", field.key(), field.value());
         }
 
-        let req = &mut transaction.state.client_request;
-
         log_debug!(PLUGIN, "-- printing response headers");
-        let resp = &transaction.state.client_response;
+        let resp = &transaction.client_response();
         for field in resp.headers.iter() {
             log_debug!(PLUGIN, "  -- {}: {}", field.key(), field.value());
         }
-
-        for _field in req.headers.iter() {}
 
         Action::Resume
     }
 }
 
 fn log_cache_hit(cached: &mut CacheEntry) {
-    let status = cached.response.status;
+    let status = cached.response.status();
     let cache_control = cached
         .response
         .headers

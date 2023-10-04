@@ -1,39 +1,47 @@
 use trafficserver::{
-    log_debug, Action, CacheEntry, CacheLookupState, CacheStatus, GlobalPlugin, Hook, Plugin,
-    ReadRequestState, SendResponseState, Transaction,
+    log_debug, Action, CacheEntry, CacheLookupState, CacheStatus, HttpEvent, HttpHook, Plugin,
+    PluginMut, SendResponseState, Transaction,
 };
 
 const PLUGIN: &str = "plugin";
 
 fn init(_args: Vec<String>) {
     trafficserver::register_plugin("ExamplePlugin", "example", "mail@example.com");
-
-    let handler = Box::new(GlobalHandler {});
-    trafficserver::register_global_hooks(vec![Hook::HttpReadRequestHeaders], handler);
+    trafficserver::add_http_hooks([HttpHook::ReadRequestHeaders].into(), GlobalHandler {});
 }
 
 trafficserver::plugin_init!(init);
 
 struct GlobalHandler {}
 
-impl GlobalPlugin for GlobalHandler {
-    fn read_request_headers(&self, transaction: &mut Transaction<ReadRequestState>) -> Action {
-        log_debug!(PLUGIN, "global plugin: read request headers");
-
-        let plugin = Box::new(TransactionHandler {});
-        transaction.add_plugin(
-            vec![Hook::HttpSendResponseHeaders, Hook::HttpCacheLookup],
-            plugin,
-        );
+impl Plugin for GlobalHandler {
+    fn handle_event(&self, event: HttpEvent) -> Action {
+        if let HttpEvent::ReadRequestHeader(mut tx) = event {
+            log_debug!(PLUGIN, "global plugin: read request headers");
+            tx.add_plugin(
+                [HttpHook::SendResponseHeaders, HttpHook::CacheLookup].into(),
+                TransactionHandler {},
+            );
+        }
         Action::Resume
     }
 }
 
 struct TransactionHandler {}
 
-impl Plugin for TransactionHandler {
+impl PluginMut for TransactionHandler {
+    fn handle_event(&mut self, event: HttpEvent) -> Action {
+        match event {
+            HttpEvent::SendResponseHeader(mut tx) => self.send_response_headers(&mut tx),
+            HttpEvent::CacheLookupComplete(mut tx) => self.cache_lookup(&mut tx),
+            _ => Action::Resume,
+        }
+    }
+}
+
+impl TransactionHandler {
     fn cache_lookup(&mut self, transaction: &mut Transaction<CacheLookupState>) -> Action {
-        match &mut transaction.cache_status() {
+        match transaction.cache_status() {
             CacheStatus::HitFresh(cached) => log_cache_hit(cached),
             CacheStatus::HitStale(cached) => log_cache_hit(cached),
             CacheStatus::Miss => {
@@ -87,7 +95,7 @@ impl Plugin for TransactionHandler {
     }
 }
 
-fn log_cache_hit(cached: &mut CacheEntry) {
+fn log_cache_hit(cached: &CacheEntry) {
     let status = cached.response.status();
     let cache_control = cached
         .response

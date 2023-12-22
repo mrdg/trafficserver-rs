@@ -17,7 +17,9 @@ struct GlobalHandler {}
 impl Plugin for GlobalHandler {
     fn handle_event(&self, event: HttpEvent) -> Action {
         if let HttpEvent::ReadRequestHeader(mut tx) = event {
-            log_debug!(PLUGIN, "global plugin: read request headers");
+            let url = tx.effective_url();
+            log_debug!(PLUGIN, "global plugin: received request for {}", url);
+            tx.set_cache_url(url.trim_end_matches('/'));
             tx.add_plugin(
                 [HttpHook::SendResponseHeaders, HttpHook::CacheLookup].into(),
                 TransactionHandler {},

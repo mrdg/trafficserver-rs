@@ -13,15 +13,16 @@ pub use trafficserver_sys::TSDebug;
 pub use trafficserver_sys::TSHttpStatus as HttpStatus;
 
 use trafficserver_sys::{
-    TSCacheLookupResult, TSCont, TSContCreate, TSContDataGet, TSContDataSet, TSContDestroy,
-    TSEvent, TSHandleMLocRelease, TSHttpHdrStatusGet, TSHttpHookAdd, TSHttpHookID, TSHttpTxn,
-    TSHttpTxnCacheLookupStatusGet, TSHttpTxnCacheLookupStatusSet, TSHttpTxnCachedReqGet,
-    TSHttpTxnCachedRespGet, TSHttpTxnClientReqGet, TSHttpTxnClientRespGet, TSHttpTxnHookAdd,
-    TSHttpTxnReenable, TSHttpTxnServerRespGet, TSMBuffer, TSMLoc, TSMimeHdrFieldAppend,
-    TSMimeHdrFieldCreate, TSMimeHdrFieldDestroy, TSMimeHdrFieldFind, TSMimeHdrFieldGet,
-    TSMimeHdrFieldNameGet, TSMimeHdrFieldNameSet, TSMimeHdrFieldNext, TSMimeHdrFieldNextDup,
-    TSMimeHdrFieldValueStringGet, TSMimeHdrFieldValueStringInsert, TSMimeHdrFieldsCount,
-    TSPluginRegister, TSPluginRegistrationInfo, TSReturnCode,
+    TSCacheLookupResult, TSCacheUrlSet, TSCont, TSContCreate, TSContDataGet, TSContDataSet,
+    TSContDestroy, TSEvent, TSHandleMLocRelease, TSHttpHdrStatusGet, TSHttpHookAdd, TSHttpHookID,
+    TSHttpTxn, TSHttpTxnCacheLookupStatusGet, TSHttpTxnCacheLookupStatusSet, TSHttpTxnCachedReqGet,
+    TSHttpTxnCachedRespGet, TSHttpTxnClientReqGet, TSHttpTxnClientRespGet,
+    TSHttpTxnEffectiveUrlStringGet, TSHttpTxnHookAdd, TSHttpTxnReenable, TSHttpTxnServerRespGet,
+    TSMBuffer, TSMLoc, TSMimeHdrFieldAppend, TSMimeHdrFieldCreate, TSMimeHdrFieldDestroy,
+    TSMimeHdrFieldFind, TSMimeHdrFieldGet, TSMimeHdrFieldNameGet, TSMimeHdrFieldNameSet,
+    TSMimeHdrFieldNext, TSMimeHdrFieldNextDup, TSMimeHdrFieldValueStringGet,
+    TSMimeHdrFieldValueStringInsert, TSMimeHdrFieldsCount, TSPluginRegister,
+    TSPluginRegistrationInfo, TSReturnCode, _TSfree,
 };
 
 type EventHandler = fn(Cont, TSEvent, *mut ffi::c_void) -> ReturnCode;
@@ -385,6 +386,17 @@ impl<'a, S: State> Transaction<'a, S> {
         self.inner.set_client_request(self.txn);
         self.inner.client_request.get_mut().unwrap()
     }
+
+    pub fn effective_url(&self) -> String {
+        let mut length: ffi::c_int = 0;
+        let bytes = unsafe {
+            let buf = TSHttpTxnEffectiveUrlStringGet(self.txn.0, &mut length);
+            let bytes = slice::from_raw_parts::<u8>(buf as *const u8, length as usize).to_owned();
+            _TSfree(buf as *mut ffi::c_void);
+            bytes
+        };
+        String::from_utf8(bytes).ok().unwrap()
+    }
 }
 
 fn handle_transaction_event(mut cont: Cont, event: TSEvent, edata: *mut ffi::c_void) -> ReturnCode {
@@ -423,8 +435,9 @@ fn handle_transaction_event(mut cont: Cont, event: TSEvent, edata: *mut ffi::c_v
 }
 
 impl<S: PreCache> Transaction<'_, S> {
-    pub fn set_cache_url(&mut self) {
-        todo!()
+    pub fn set_cache_url(&mut self, url: &str) -> ReturnCode {
+        let res = unsafe { TSCacheUrlSet(self.txn.0, url.as_ptr() as *const i8, url.len() as i32) };
+        res.into()
     }
 }
 
@@ -549,10 +562,7 @@ fn set_cache_status(txn: TxHandle, current: &CacheStatus, new: CacheStatusOverri
         Miss => TSCacheLookupResult::TS_CACHE_LOOKUP_MISS,
     };
     let res = unsafe { TSHttpTxnCacheLookupStatusSet(txn.0, status.0 as i32) };
-    if res == TSReturnCode::TS_ERROR {
-        return ReturnCode::Error;
-    }
-    ReturnCode::Success
+    res.into()
 }
 
 fn cache_lookup_status(txn: TxHandle) -> CacheStatus {
@@ -654,6 +664,16 @@ impl From<ReturnCode> for TSReturnCode {
         match value {
             ReturnCode::Success => TSReturnCode::TS_SUCCESS,
             ReturnCode::Error => TSReturnCode::TS_ERROR,
+        }
+    }
+}
+
+impl From<TSReturnCode> for ReturnCode {
+    fn from(value: TSReturnCode) -> Self {
+        match value {
+            TSReturnCode::TS_ERROR => ReturnCode::Error,
+            TSReturnCode::TS_SUCCESS => ReturnCode::Success,
+            _ => unreachable!(),
         }
     }
 }
